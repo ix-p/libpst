@@ -62,6 +62,7 @@ void      write_vcard(FILE* f_output, pst_item *item, pst_item_contact* contact,
 int       write_extra_categories(FILE* f_output, pst_item* item);
 void      write_journal(FILE* f_output, pst_item* item);
 void      write_appointment(FILE* f_output, pst_item *item);
+const char* resolve_dtstamp_value(pst_item* item, size_t buf_size, char* buf);
 void      create_enter_dir(struct file_ll* f, pst_item *item);
 void      close_enter_dir(struct file_ll *f);
 char*     quote_string(char *inp);
@@ -131,6 +132,8 @@ int         contact_mode_specified = 0;
 int         overwrite = 0;
 int         prefer_utf8 = 0;
 int         save_rtf_body = 1;
+int         exclude_read_status = 0;
+int         dtstamp_from_existing = 0;
 int         file_name_len = 10;     // enough room for MODE_SPEARATE file name
 pst_file    pstfile;
 regex_t     meta_charset_pattern;
@@ -422,7 +425,7 @@ int main(int argc, char* const* argv) {
     }
 
     // command-line option handling
-    while ((c = getopt(argc, argv, "a:bC:c:Dd:emhj:kMo:qrSt:uVwL:8"))!= -1) {
+    while ((c = getopt(argc, argv, "a:bC:c:Dd:emhj:kMo:qrSt:uVwL:8XT"))!= -1) {
         switch (c) {
         case 'a':
             if (optarg) {
@@ -562,6 +565,12 @@ int main(int argc, char* const* argv) {
             break;
         case '8':
             prefer_utf8 = 1;
+            break;
+        case 'X':
+            exclude_read_status = 1;
+            break;
+        case 'T':
+            dtstamp_from_existing = 1;
             break;
         default:
             usage();
@@ -742,6 +751,8 @@ void usage() {
     printf("\t-u\t- Thunderbird mode. Write two extra .size and .type files\n");
     printf("\t-w\t- Overwrite any output mbox files\n");
     printf("\t-8\t- Output bodies in UTF-8, rather than original encoding, if UTF-8 version is available\n");
+    printf("\t-X\t- Exclude synthesized Status: RO output\n");
+    printf("\t-T\t- DTSTAMP fallback: DTSTAMP, LAST-MOD, CREATED, now\n");
     printf("\n");
     printf("Only one of -M -S -e -k -m -r should be specified\n");
     DEBUG_RET();
@@ -1825,7 +1836,7 @@ void write_normal_email(FILE* f_output, char f_name[], pst_item* item, int curre
     }
 
     // record read status
-    if ((item->flags & PST_FLAG_READ) == PST_FLAG_READ) {
+    if (!exclude_read_status && ((item->flags & PST_FLAG_READ) == PST_FLAG_READ)) {
         fprintf(f_output, "Status: RO\n");
     }
 
@@ -2188,6 +2199,27 @@ int write_extra_categories(FILE* f_output, pst_item* item)
 }
 
 
+const char* resolve_dtstamp_value(pst_item* item, size_t buf_size, char* buf)
+{
+    if (dtstamp_from_existing && item) {
+        pst_item_extra_field* ef = item->extra_fields;
+        while (ef) {
+            if (ef->field_name && ef->value && (strcasecmp(ef->field_name, "DTSTAMP") == 0) && ef->value[0]) {
+                return ef->value;
+            }
+            ef = ef->next;
+        }
+        if (item->modify_date) {
+            return pst_rfc2445_datetime_format(item->modify_date, buf_size, buf);
+        }
+        if (item->create_date) {
+            return pst_rfc2445_datetime_format(item->create_date, buf_size, buf);
+        }
+    }
+    return pst_rfc2445_datetime_format_now(buf_size, buf);
+}
+
+
 void write_journal(FILE* f_output, pst_item* item)
 {
     char*  result = NULL;
@@ -2204,10 +2236,8 @@ void write_journal(FILE* f_output, pst_item* item)
     // https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcical/4b93e7b6-142e-4f0c-ac08-1505a6fa0199
     // https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidlidattendeecriticalchange-canonical-property
     // https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidlidownercriticalchange-canonical-property
-    if (item->create_date)
-        fprintf(f_output, "DTSTAMP:%s\n",                 pst_rfc2445_datetime_format(item->create_date, sizeof(time_buffer), time_buffer));
-    else
-        fprintf(f_output, "DTSTAMP:%s\n",                 pst_rfc2445_datetime_format_now(sizeof(time_buffer), time_buffer));
+    fprintf(f_output, "DTSTAMP:%s\n",                     resolve_dtstamp_value(item, sizeof(time_buffer), time_buffer));
+
     if (item->create_date)
         fprintf(f_output, "CREATED:%s\n",                 pst_rfc2445_datetime_format(item->create_date, sizeof(time_buffer), time_buffer));
     if (item->modify_date)
@@ -2234,16 +2264,13 @@ void write_appointment(FILE* f_output, pst_item* item)
     pst_convert_utf8_null(item, &item->subject);
     pst_convert_utf8_null(item, &item->body);
     pst_convert_utf8_null(item, &appointment->location);
-
     fprintf(f_output, "UID:%#" PRIx64 "\n", item->block_id);
     // FIXME: use the attendee/owner critical change property for DTSTAMP
     // https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcical/4b93e7b6-142e-4f0c-ac08-1505a6fa0199
     // https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidlidattendeecriticalchange-canonical-property
     // https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidlidownercriticalchange-canonical-property
-    if (item->create_date)
-        fprintf(f_output, "DTSTAMP:%s\n",                 pst_rfc2445_datetime_format(item->create_date, sizeof(time_buffer), time_buffer));
-    else
-        fprintf(f_output, "DTSTAMP:%s\n",                 pst_rfc2445_datetime_format_now(sizeof(time_buffer), time_buffer));
+    fprintf(f_output, "DTSTAMP:%s\n",                     resolve_dtstamp_value(item, sizeof(time_buffer), time_buffer));
+
     if (item->create_date)
         fprintf(f_output, "CREATED:%s\n",                 pst_rfc2445_datetime_format(item->create_date, sizeof(time_buffer), time_buffer));
     if (item->modify_date)
